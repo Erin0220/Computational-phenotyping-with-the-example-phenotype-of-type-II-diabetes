@@ -1,0 +1,344 @@
+---
+title: Develop a Computational Phenotyping Algorithm to Identify Patients with Type
+  II diabetes
+output:
+  html_document:
+    theme: readable
+    toc: true
+    toc_float: true
+    number_sections: false
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+### Background on Diabetes
+
+Type II diabetes is a type of diabetes that is caused by the body no longer recognizing and appropriately responding to insulin.
+
+#### Diagnostic Criteria
+- A fasting plasma glucose level of 126 mg/dL (7.0 mmol/L) or higher **OR**
+- A 2-hour plasma glucose level of 200 mg/dL (11.1 mmol/L) or higher during a 75g OGTT **OR**
+- A random plasma glucose of 200 mg/dL (11.1 mmol/L) or higher + symptoms **OR**
+- HbA1c of 6.5% or higher
+
+#### Treatments
+- Metformin
+- Sulfonylureas (e.g., glyburide, glimepiride…)
+- Thiazolidinediones (e.g., pioglitazone…)
+- DPP-4 inhibitors (e.g., sitagliptin…)
+- SGLT2 inhibitors (e.g., canagliflozin…)
+- GLP-1 receptor agonists (e.g., liraglutide…)
+
+#### Laboratory Tests
+- Plasma glucose (fasting / random / 2-hour OGTT)
+- HbA1c
+
+### Set up connection to the Google BigQuery project 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+library(tidyverse)
+library(magrittr)
+library(bigrquery)
+library(DBI)
+
+con <- DBI::dbConnect(
+  drv = bigquery(),
+  project = "learnclinicaldatascience"
+)
+
+my_project <- "learnclinicaldatascience"
+```
+
+
+### Load diababetes goldstandard
+```{r}
+diabetes <- bq_project_query(
+  my_project,
+  "
+  SELECT SUBJECT_ID, DIABETES
+  FROM `course3_data.diabetes_goldstandard`
+  "
+) %>% bq_table_download()
+
+knitr::kable(diabetes)
+```
+###### In this table the DIABETES column is a 1 if the patient has a record of type II diabetes and a 0 if they did not have the condition.Of the 100 patients in the demo data set, 99 had notes that could be reviewed. Of those 99 records reviewed, 34 had type II diabetes.
+
+#### Querying and Assessing ICD codes
+**There are many ICD-9 codes for diabetes:**
+
+| ICD-9 Code | Label |
+|----------|------|
+| 250 | Diabetes mellitus |
+| 250.0 | Diabetes mellitus without mention of complication |
+| 250.00 | Diabetes mellitus without mention of complication, type II or unspecified type, not stated as uncontrolled |
+| 250.01 | Diabetes mellitus without mention of complication, type I (juvenile type), not stated as uncontrolled |
+| 250.02 | Diabetes mellitus without mention of complication, type II or unspecified type, uncontrolled |
+
+```{r}
+#Load the tables 
+training <- tbl(con, "course3_data.diabetes_training")
+diagnoses_icd <- tbl(con, "mimic3_demo.DIAGNOSES_ICD")
+
+#Identify the patients with ICD_25000
+icd_25000 <- diagnoses_icd %>% 
+  filter(ICD9_CODE == "25000") %>% 
+  distinct(SUBJECT_ID) %>% 
+  mutate(icd_25000 = 1)
+knitr::kable(head(icd_25000,10))
+```
+
+```{r}
+# Join icd_25000 with the diabetes data frame 
+training_joined <- training %>%
+  left_join(icd_25000, by = "SUBJECT_ID") %>%
+  mutate(icd_25000 = coalesce(icd_25000, 0))
+
+knitr::kable(head(training_joined,20))
+```
+
+```{r getStats-function}
+# Function to Calculate Performance
+library(caret)
+getStats <- function(df, ...) {
+  df %>%
+    select(...) %>%
+    mutate(across(everything(), ~ factor(.x, levels = c(1, 0)))) %>%
+    table() %>%
+    confusionMatrix()
+}
+```
+
+```{r calculate performance}
+# Calculate the performance of icd_25000
+training %<>% 
+  left_join(icd_25000) %>% 
+  mutate(icd_25000 = coalesce(icd_25000, 0))
+training %>% 
+  collect() %>% 
+  getStats(icd_25000, DIABETES)
+```
+#####  This code actually performs fairly well. ICD9 250.00 has a decent specificity of 98.11%. However the sensitivity is not great at only 70.37%.
+
+### Querying and Assessing laboratory data
+##### As described in the introduction, there are a number of laboratory tests used to diagnose diabetes.We will take a look at just Hemoglobin A1C. MIMIC-III records lab tests with a variety of labels. We can search these labels in the D_LABITEMS table. The following SQL query was executed in **BigQuery**:
+
+select * from mimic3_demo.D_LABITEMS where lower(LABEL) like "%a1c%"
+
+The results were:
+
+| ITEMID | LABEL |
+|--------|------------------|
+| 50852  | % Hemoglobin A1c |
+| 50854  | Absolute A1c     |
+
+
+```{r}
+# Load labevents table
+labevents <- tbl(con, "mimic3_demo.LABEVENTS")
+
+# Identify patients with hba1c
+hba1c <- labevents %>% 
+  filter(ITEMID %in% c(50852,50854)) %>% 
+  distinct(SUBJECT_ID) %>% 
+  mutate(hba1c = 1)
+
+# Merge hba1c indicator into training dataset
+training %<>% 
+  left_join(hba1c) %>% 
+  mutate(hba1c = coalesce(hba1c, 0))
+
+# Evaluate performance
+training %>% 
+  collect() %>% 
+  getStats(hba1c, DIABETES)
+```
+##### The combined HbA1c labs have a moderate specificity of 94.34%. However the sensitivity is very poor at only 25.93%.
+
+### Querying and Assessing Medication data
+As described in the introduction, there are a number of medications used to treat diabetes. Let’s try the first-line treatment metformin.
+
+```{r}
+# Load PRESCRIPTIONS table
+prescriptions <- tbl(con, "mimic3_demo.PRESCRIPTIONS")
+
+# Identify patients with Metformin prescriptions
+metformin <- prescriptions %>% 
+  filter(tolower(DRUG) %like% "%metformin%") %>% 
+  distinct(SUBJECT_ID) %>% 
+  mutate(metformin = 1)
+knitr::kable(head(metformin,20))
+```
+
+```{r}
+# Merge Metformin indicator into training dataset
+training_metformin <- training %>% 
+    left_join(metformin, by = "SUBJECT_ID") %>% 
+    mutate(metformin = coalesce(metformin, 0))
+knitr::kable(head(training_metformin,20))
+```
+```{r}
+# Evaluate performance
+training_metformin %>% 
+    collect() %>% 
+    getStats(metformin, DIABETES)
+```
+##### Metformin has a perfect specificity of 100%. However the sensitivity is exceptionally poor at only 7.41%. This is likely due to the fact that most hospitalized patients are transitioned to insulin during their hospital stay.
+
+### Querying and Assessing the mean value of blood glucose blood gas of at least 200 mg/dL
+```{r mean-glucose-bg-over200, message=FALSE, warning=FALSE}
+
+# 1) Create a binary feature: mean blood gas glucose >= 200
+labevents <- tbl(con, "mimic3_demo.LABEVENTS")
+d_labitems <- tbl(con, "mimic3_demo.D_LABITEMS")
+mean_glucose_blood_bg_over200 <- labevents %>% 
+  inner_join(d_labitems, by = "ITEMID", suffix = c("_l","_d")) %>% 
+  filter(
+    LABEL == "Glucose",
+    FLUID == "Blood",
+    CATEGORY == "Blood Gas"
+  ) %>% 
+  group_by(SUBJECT_ID) %>% 
+  summarise(glucose_blood_bg_mean = mean(VALUENUM, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(mean_glucose_blood_bg_over200 = if_else(glucose_blood_bg_mean >= 200, 1L, 0L)) %>% 
+  select(SUBJECT_ID, glucose_blood_bg_mean, mean_glucose_blood_bg_over200)
+knitr::kable(head(mean_glucose_blood_bg_over200,20))
+
+# 2) Join into training + fill missing with 0
+training_glucose <- training %>% 
+  left_join(mean_glucose_blood_bg_over200, by = "SUBJECT_ID") %>% 
+  mutate(mean_glucose_blood_bg_over200 = coalesce(mean_glucose_blood_bg_over200, 0L))
+knitr::kable(head(training_glucose,20))
+
+# 3) Collect to local and run getStats
+training_glucose_local <- training_glucose %>% collect()
+
+cm <- training_glucose_local %>% 
+  getStats(mean_glucose_blood_bg_over200, DIABETES)
+
+cm   # prints confusion matrix + stats
+```
+##### The mean value of blood glucose blood gas of at least 200 mg/dL has a good specificity of 96%. However the sensitivity is exceptionally poor at only 7.41%.
+
+### Querying and Assessing the comibination of metformin and insulin
+
+```{r}
+#Load the prescriptions table
+prescriptions <- tbl(con, "mimic3_demo.PRESCRIPTIONS")
+
+#Identify the patients with metfomin and insulin prescriptions
+metformin_and_insulin <- prescriptions %>% 
+  filter(lower(DRUG) %like% "metformin" |
+           lower(DRUG) %like% "insulin") %>% 
+  mutate(metformin_counter = case_when(lower(DRUG) %like% "%metformin%" ~ 1,
+                                       TRUE ~ 0),
+         insulin_counter = case_when(lower(DRUG) %like% "%insulin%" ~ 1,
+                                     TRUE ~ 0)) %>% 
+  group_by(SUBJECT_ID) %>% 
+  summarise(any_metformin = max(metformin_counter, na.rm = TRUE),
+            any_insulin = max(insulin_counter, na.rm = TRUE)) %>% 
+  filter(any_metformin == 1,
+         any_insulin == 1) %>% 
+  mutate(metformin_and_insulin = 1)
+# Join with the training data
+training %>% 
+  left_join(metformin_and_insulin) %>% 
+  mutate(metformin_and_insulin = coalesce(metformin_and_insulin, 0)) %>% 
+  collect() %>% 
+# Evaluate performance
+  getStats(metformin_and_insulin, DIABETES)
+```
+##### The comibination of metformin and insulin has a perfect specificity of 100%. However the sensitivity is exceptionally poor at only 7.41%.
+
+### Querying and Assessing the comibination of ICD9 OR Glucose>=200 OR Insulin
+```{r}
+#Load tables
+labevents <- tbl(con, "mimic3_demo.LABEVENTS")
+d_labitems <- tbl(con, "mimic3_demo.D_LABITEMS")
+#Identify the patients with ICD
+any_t2d_icd <- diagnoses_icd %>% 
+  filter(ICD9_CODE %in% c("25000", "25002","25010", "25012","25020", "25022","25030", 
+                          "25032","25040", "25042","25050", "25052","25060", "25062",
+                          "25070", "25072","25080", "25082","25090", "25092")) %>% 
+  distinct(SUBJECT_ID) %>% 
+  mutate(any_t2d_icd = 1)
+#Identify the patients with Glucose>=200 
+any_glucose_blood_bg_over200 <- labevents %>% 
+  inner_join(d_labitems, by = c("ITEMID" = "ITEMID"), suffix = c("_l","_d")) %>% 
+  filter(LABEL == "Glucose",
+         FLUID == "Blood",
+         CATEGORY == "Blood Gas") %>% 
+  group_by(SUBJECT_ID) %>% 
+  mutate(glucose_blood_bg_over200_marker = case_when(VALUENUM >= 200 ~ 1,
+                                                     TRUE ~0)) %>% 
+  summarise(any_glucose_blood_bg_over200 = max(glucose_blood_bg_over200_marker, na.rm = TRUE)) %>% 
+  select(SUBJECT_ID, any_glucose_blood_bg_over200)
+#Identify the patients with Insulin
+any_insulin <- prescriptions %>% 
+  filter(lower(DRUG) %like% "insulin") %>% 
+  distinct(SUBJECT_ID) %>% 
+  mutate(any_insulin = 1)
+#Join with the training data
+training %>% 
+  left_join(any_t2d_icd) %>% 
+  left_join(any_glucose_blood_bg_over200) %>% 
+  left_join(any_insulin) %>% 
+  mutate(any_t2d_icd = coalesce(any_t2d_icd, 0),
+         any_glucose_blood_bg_over200 = coalesce(any_glucose_blood_bg_over200, 0),
+         any_insulin = coalesce(any_insulin, 0)) %>% 
+  mutate(icd_or_glucose_or_insulin = case_when(any_t2d_icd == 1 |
+                                                 any_glucose_blood_bg_over200 == 1 |
+                                                 any_insulin == 1 ~ 1,
+                                               TRUE ~ 0)) %>% 
+  collect() %>% 
+# Evaluate performance
+  getStats(icd_or_glucose_or_insulin, DIABETES)
+```
+##### The comibination of ICD9 OR Glucose>=200 OR Insulin has a poor specificity of 35.9%. However the sensitivity is exceptionally high at only 96.3%.
+
+### Querying and Assessing the comibination of ICD9 AND Glucose>=200 AND Insulin
+
+```{r}
+#Join with the traing data
+training %>% 
+  left_join(any_t2d_icd) %>% 
+  left_join(any_glucose_blood_bg_over200) %>% 
+  left_join(any_insulin) %>% 
+  mutate(any_t2d_icd = coalesce(any_t2d_icd, 0),
+         any_glucose_blood_bg_over200 = coalesce(any_glucose_blood_bg_over200, 0),
+         any_insulin = coalesce(any_insulin, 0)) %>% 
+  mutate(icd_and_glucose_and_insulin = case_when(any_t2d_icd == 1 &&
+                                                 any_glucose_blood_bg_over200 == 1 &&
+                                                 any_insulin == 1 ~ 1,
+                                               TRUE ~ 0)) %>%
+  collect() %>% 
+# Evaluate performance
+  getStats(icd_and_glucose_and_insulin, DIABETES)
+```
+##### The comibination of ICD9 AND Glucose>=200 AND Insulin has a perfect specificity of 100%. However the sensitivity is exceptionally poor at only 11%.
+
+### Querying and Assessing the comibination of Insulin AND (ICD OR Glucose >=200)
+```{r}
+#Join with the traing data
+training %>% 
+  left_join(any_t2d_icd) %>% 
+  left_join(any_glucose_blood_bg_over200) %>% 
+  left_join(any_insulin) %>% 
+  mutate(any_t2d_icd = coalesce(any_t2d_icd, 0),
+         any_glucose_blood_bg_over200 = coalesce(any_glucose_blood_bg_over200, 0),
+         any_insulin = coalesce(any_insulin, 0)) %>% 
+  mutate(insulin_and_ICDorGlucose = case_when(any_insulin == 1 &&
+                                                (any_glucose_blood_bg_over200 ==1 | any_t2d_icd == 1) ~ 1,
+                                              TRUE ~0)) %>%
+  collect() %>% 
+# Evaluate performance
+  getStats(insulin_and_ICDorGlucose, DIABETES)
+```
+##### Using insulin alone had a specificity of 37.74%, and a sensitivity of 85.19%.By requiring that patients with insuline must also have a record of an ICD9 code or high glucose measurement we raised the specificity to 86.79%, and only dropped the sensitivity to 66.67%.
+
+#### Rendered Report
+
+The rendered HTML report is available here:
+- [Download diabetes2.html](diabetes2.html)
+
+Please download and open in a browser to view the full report.
